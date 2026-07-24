@@ -3053,8 +3053,15 @@ impl Dataset {
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
-        let accessor =
-            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
+        // A URI destination builds a fresh object store from these params, so the
+        // namespace-backed provider has to be attached here for vended credentials to
+        // refresh during the commit. A Dataset destination reuses the object store the
+        // dataset was opened with, which already carries its own provider.
+        let accessor = crate::storage_options::create_accessor_from_storage_options(
+            storage_options.clone(),
+            namespace_client,
+            table_id.as_deref(),
+        )?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
@@ -3142,8 +3149,13 @@ impl Dataset {
         max_retries: Option<u32>,
         commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
-        let accessor =
-            crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
+        // TODO: commit_batch does not accept namespace parameters yet, so vended
+        // credentials cannot be refreshed here.
+        let accessor = crate::storage_options::create_accessor_from_storage_options(
+            storage_options.clone(),
+            None,
+            None,
+        )?;
 
         let object_store_params = if accessor.is_some() {
             Some(ObjectStoreParams {
@@ -4720,30 +4732,15 @@ pub fn get_write_params(
         let namespace_client_opt = get_dict_opt::<Bound<PyAny>>(options, "namespace_client")?;
         let table_id_opt = get_dict_opt::<Vec<String>>(options, "table_id")?;
 
-        if let Some(so) = storage_options.clone() {
-            // If namespace_client and table_id are provided, create storage options provider from them
-            if let (Some(ns_client), Some(table_id)) =
-                (namespace_client_opt.as_ref(), table_id_opt.as_ref())
-            {
-                let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                    LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.clone()),
-                );
-                let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                    so, provider,
-                ));
-                p.store_params = Some(ObjectStoreParams {
-                    storage_options_accessor: Some(accessor),
-                    ..Default::default()
-                });
-            } else {
-                // No namespace, just use storage options directly
-                let accessor = Arc::new(StorageOptionsAccessor::with_static_options(so));
-                p.store_params = Some(ObjectStoreParams {
-                    storage_options_accessor: Some(accessor),
-                    ..Default::default()
-                });
-            }
+        if let Some(accessor) = crate::storage_options::create_accessor_from_storage_options(
+            storage_options.clone(),
+            namespace_client_opt.as_ref(),
+            table_id_opt.as_deref(),
+        )? {
+            p.store_params = Some(ObjectStoreParams {
+                storage_options_accessor: Some(accessor),
+                ..Default::default()
+            });
         }
 
         if let Some(enable_stable_row_ids) = get_dict_opt::<bool>(options, "enable_stable_row_ids")?

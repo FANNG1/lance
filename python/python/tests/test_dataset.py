@@ -1812,6 +1812,25 @@ def test_commit_timeout(tmp_path: Path):
     # throttling would be flaky on fast runners.
 
 
+def test_commit_requires_namespace_client_and_table_id_together(tmp_path: Path):
+    # A half-specified namespace would silently fall back to non-refreshing
+    # credentials, which is exactly what the namespace arguments are meant to avoid.
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    append = lance.LanceOperation.Append([fragment])
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        lance.LanceDataset.commit(dataset, append, read_version=1, table_id=["a", "b"])
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, namespace_client=object()
+        )
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

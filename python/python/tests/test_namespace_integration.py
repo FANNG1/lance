@@ -751,6 +751,147 @@ def test_namespace_distributed_write(s3_bucket: str, use_custom: bool):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_commit_refreshes_expired_credentials(
+    s3_bucket: str, use_custom: bool
+):
+    """Commit must refresh credentials that expired while fragments were written.
+
+    A distributed write can outlive the credentials handed out at planning time, so
+    the commit that lands the manifest is exactly where a stale token shows up. The
+    credentials are marked expired directly instead of waiting for a real TTL.
+    """
+    storage_options = copy.deepcopy(CONFIG)
+
+    ns_client, inner_ns_client = create_tracking_namespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3600,
+        use_custom=use_custom,
+    )
+
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    response = ns_client.declare_table(DeclareTableRequest(id=table_id, location=None))
+    table_uri = response.location
+    assert table_uri is not None
+    assert response.storage_options is not None
+
+    merged_options = dict(storage_options)
+    merged_options.update(response.storage_options)
+    assert "expires_at_millis" in merged_options
+
+    from lance.fragment import write_fragments
+
+    data = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 3, "b": 4}])
+    fragments = write_fragments(
+        data,
+        table_uri,
+        storage_options=merged_options,
+        namespace_client=ns_client,
+        table_id=table_id,
+    )
+
+    # Simulate credentials that expired during the write.
+    expired_options = dict(merged_options)
+    expired_options["expires_at_millis"] = str(int(time.time() * 1000) - 60_000)
+
+    calls_before_commit = get_describe_call_count(inner_ns_client)
+    ds = lance.LanceDataset.commit(
+        table_uri,
+        lance.LanceOperation.Overwrite(data.schema, fragments),
+        storage_options=expired_options,
+        namespace_client=ns_client,
+        table_id=table_id,
+    )
+    assert ds.count_rows() == 2
+    # Exactly one refresh: the commit picked up fresh credentials without falling
+    # into a per-request fetch.
+    assert get_describe_call_count(inner_ns_client) == calls_before_commit + 1
+
+    # Control: without namespace arguments the commit path stays fully static and
+    # must not reach the namespace at all.
+    more_data = pa.Table.from_pylist([{"a": 5, "b": 6}])
+    more_fragments = write_fragments(
+        more_data,
+        table_uri,
+        storage_options=merged_options,
+    )
+    calls_before_static_commit = get_describe_call_count(inner_ns_client)
+    ds = lance.LanceDataset.commit(
+        table_uri,
+        lance.LanceOperation.Append(more_fragments),
+        read_version=ds.version,
+        storage_options=merged_options,
+    )
+    assert ds.count_rows() == 3
+    assert get_describe_call_count(inner_ns_client) == calls_before_static_commit
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_commit_with_dataset_destination(s3_bucket: str, use_custom: bool):
+    """A dataset destination commits through the store the dataset was opened with.
+
+    The storage options passed to commit() are ignored in that case, so marking them
+    expired does not force a refresh.
+    """
+    storage_options = copy.deepcopy(CONFIG)
+
+    ns_client, inner_ns_client = create_tracking_namespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3600,
+        use_custom=use_custom,
+    )
+
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+    data = pa.Table.from_pylist([{"a": 1, "b": 2}])
+
+    lance.write_dataset(
+        data,
+        namespace_client=ns_client,
+        table_id=table_id,
+        mode="create",
+        storage_options=storage_options,
+    )
+
+    ds = lance.dataset(
+        namespace_client=ns_client,
+        table_id=table_id,
+        storage_options=storage_options,
+    )
+
+    from lance.fragment import write_fragments
+
+    more_data = pa.Table.from_pylist([{"a": 10, "b": 20}])
+    fragments = write_fragments(
+        more_data,
+        ds.uri,
+        storage_options=storage_options,
+        namespace_client=ns_client,
+        table_id=table_id,
+    )
+
+    expired_options = dict(storage_options)
+    expired_options["expires_at_millis"] = str(int(time.time() * 1000) - 60_000)
+
+    calls_before_commit = get_describe_call_count(inner_ns_client)
+    committed = lance.LanceDataset.commit(
+        ds,
+        lance.LanceOperation.Append(fragments),
+        read_version=ds.version,
+        storage_options=expired_options,
+        namespace_client=ns_client,
+        table_id=table_id,
+    )
+    assert committed.count_rows() == 2
+    assert get_describe_call_count(inner_ns_client) == calls_before_commit
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
 def test_file_writer_with_namespace_client(s3_bucket: str, use_custom: bool):
     """Test LanceFileWriter with namespace_client and credential refresh."""
     from lance.file import LanceFileReader, LanceFileWriter
