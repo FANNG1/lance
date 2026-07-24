@@ -136,8 +136,12 @@ impl LanceNamespaceStorageOptionsProvider {
 #[async_trait]
 impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
     async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        // The only purpose of this request is to obtain credentials, so ask for them
+        // explicitly. Implementations are free to interpret an unset `vend_credentials`
+        // as "do not vend", which would silently return a response without credentials.
         let request = DescribeTableRequest {
             id: Some(self.table_id.clone()),
+            vend_credentials: Some(true),
             ..Default::default()
         };
 
@@ -1238,5 +1242,55 @@ mod tests {
         let result = base1.refresh_storage_options().await.unwrap();
         assert_eq!(result.0.get("account_key").unwrap(), "BASE1_1");
         assert_eq!(*provider.call_count.read().await, 1);
+    }
+
+    /// Records the requests a [`LanceNamespaceStorageOptionsProvider`] sends.
+    #[derive(Debug, Default)]
+    struct RecordingNamespace {
+        requests: Arc<RwLock<Vec<DescribeTableRequest>>>,
+    }
+
+    #[async_trait]
+    impl LanceNamespace for RecordingNamespace {
+        async fn describe_table(
+            &self,
+            request: DescribeTableRequest,
+        ) -> lance_namespace::Result<lance_namespace::models::DescribeTableResponse> {
+            self.requests.write().await.push(request);
+            Ok(lance_namespace::models::DescribeTableResponse {
+                location: Some("memory://table".to_string()),
+                storage_options: Some(HashMap::from([(
+                    "aws_session_token".to_string(),
+                    "TOKEN".to_string(),
+                )])),
+                ..Default::default()
+            })
+        }
+
+        fn namespace_id(&self) -> String {
+            "recording".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_namespace_provider_requests_vended_credentials() {
+        let namespace = Arc::new(RecordingNamespace::default());
+        let provider = LanceNamespaceStorageOptionsProvider::new(
+            namespace.clone(),
+            vec!["db".to_string(), "table".to_string()],
+        );
+
+        let options = provider.fetch_storage_options().await.unwrap().unwrap();
+        assert_eq!(options.get("aws_session_token").unwrap(), "TOKEN");
+
+        // Fetching credentials is the whole point of a refresh, so the request must say
+        // so rather than rely on each namespace's default interpretation.
+        let requests = namespace.requests.read().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].vend_credentials, Some(true));
+        assert_eq!(
+            requests[0].id,
+            Some(vec!["db".to_string(), "table".to_string()])
+        );
     }
 }

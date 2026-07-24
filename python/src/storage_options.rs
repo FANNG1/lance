@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_io::object_store::StorageOptionsAccessor;
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, StorageOptionsAccessor, StorageOptionsProvider,
+};
 use pyo3::prelude::*;
 
 use crate::rt;
@@ -78,15 +80,40 @@ impl PyStorageOptionsAccessor {
 
 /// Create a StorageOptionsAccessor from storage options
 ///
-/// This creates an accessor with static options only.
-#[allow(dead_code)]
+/// When a namespace client and table id are given, the accessor is backed by a
+/// [`LanceNamespaceStorageOptionsProvider`] so that vended credentials are refreshed
+/// before they expire. Without them the accessor holds static options that never refresh.
+///
+/// This mirrors the guard used when opening a dataset: a provider is attached whenever
+/// storage options are present. Options without `expires_at_millis` are treated as never
+/// expiring, so they never trigger a refresh.
+///
+/// A namespace with no storage options at all yields no accessor, matching the rest of
+/// the Python surface. The Java binding and [`object_store_from_uri_or_path_with_provider`]
+/// instead fall back to `StorageOptionsAccessor::with_provider`, which fetches credentials
+/// on first use; aligning the two is a behavior change worth making on its own.
+///
+/// [`object_store_from_uri_or_path_with_provider`]: crate::file::object_store_from_uri_or_path_with_provider
 pub fn create_accessor_from_storage_options(
     storage_options: Option<HashMap<String, String>>,
+    namespace_client: Option<&Bound<'_, PyAny>>,
+    table_id: Option<&[String]>,
 ) -> PyResult<Option<Arc<StorageOptionsAccessor>>> {
-    match storage_options {
-        Some(opts) => Ok(Some(Arc::new(StorageOptionsAccessor::with_static_options(
-            opts,
-        )))),
-        None => Ok(None),
+    let Some(opts) = storage_options else {
+        return Ok(None);
+    };
+
+    if let (Some(ns_client), Some(table_id)) = (namespace_client, table_id) {
+        let ns_client = crate::namespace::extract_namespace_arc(ns_client.py(), ns_client)?;
+        let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
+            LanceNamespaceStorageOptionsProvider::new(ns_client, table_id.to_vec()),
+        );
+        return Ok(Some(Arc::new(
+            StorageOptionsAccessor::with_initial_and_provider(opts, provider),
+        )));
     }
+
+    Ok(Some(Arc::new(StorageOptionsAccessor::with_static_options(
+        opts,
+    ))))
 }

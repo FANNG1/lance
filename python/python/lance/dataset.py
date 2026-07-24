@@ -4594,6 +4594,9 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client : LanceNamespace, optional
             A namespace client. Must be provided together with table_id.
             Use lance.namespace.connect() to create a namespace.
+            When base_uri is a uri, credentials vended in storage_options are
+            refreshed through this client before they expire, which matters for
+            distributed writes whose commit happens long after planning.
         table_id : List[str], optional
             The table identifier within the namespace (e.g., ["workspace", "table"]).
             Must be provided together with namespace_client.
@@ -4648,6 +4651,11 @@ class LanceDataset(pa.dataset.Dataset):
                 raise TypeError(
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
+
+        if (namespace_client is None) != (table_id is None):
+            raise ValueError(
+                "Both 'namespace_client' and 'table_id' must be provided together."
+            )
 
         if (
             isinstance(operation, LanceOperation.BaseOperation)
