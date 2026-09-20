@@ -945,6 +945,9 @@ class LanceFragment(pa.dataset.Fragment):
 
         See Also
         --------
+        LanceFragment.update_columns_with_offsets :
+            Same operation, but also returns the matched physical row offsets
+            needed to refresh row-level version metadata for stable row IDs.
         LanceFragment.merge :
             Merge new columns into this fragment (adds columns).
         LanceDataset.update :
@@ -965,6 +968,107 @@ class LanceFragment(pa.dataset.Fragment):
             reader, left_on, right_on
         )
         return metadata, fields_modified
+
+    def update_columns_with_offsets(
+        self,
+        data_obj: ReaderLike,
+        left_on: str = "_rowid",
+        right_on: Optional[str] = None,
+        schema=None,
+    ) -> Tuple[FragmentMetadata, List[int], bytes]:
+        """
+        Update existing columns in this fragment, also returning matched offsets.
+
+        This behaves exactly like :meth:`LanceFragment.update_columns`, but
+        additionally returns the physical row offsets that matched the join.
+        A caller that assembles the ``Update`` transaction itself (for example a
+        distributed engine that rewrites columns on workers and commits once on a
+        driver) needs those offsets to refresh row-level version metadata; without
+        them the rewritten rows keep their old ``_row_last_updated_at_version``
+        and never show up in :meth:`LanceDataset.delta` results.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be used for updating. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner,
+            Iterator[RecordBatch], or RecordBatchReader
+            The data must include the join column (right_on) and the columns to update.
+        left_on: str, default "_rowid"
+            The name of the column in the fragment to join on.
+        right_on: str or None
+            The name of the column in data_obj to join on. If None, defaults to left_on.
+        schema: pa.Schema, optional
+            The schema of the data. If not specified, the schema will be inferred.
+
+        Returns
+        -------
+        Tuple[FragmentMetadata, List[int], bytes]
+            A tuple of:
+            - FragmentMetadata: The updated fragment metadata
+            - List[int]: The list of field IDs that were modified
+            - bytes: The matched physical row offsets, serialized in the portable
+              RoaringBitmap format, ready to pass to
+              :class:`lance.LanceOperation.Update` as ``updated_fragment_offsets``
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> from lance import LanceOperation
+        >>> df = pa.table({'id': [1, 2], 'value': [10, 20]})
+        >>> dataset = lance.write_dataset(df, "dataset", enable_stable_row_ids=True)
+        >>> base_version = dataset.version
+        >>> update_data = pa.table({'id': [1], 'value': [100]})
+        >>> fragment = dataset.get_fragment(0)
+        >>> metadata, fields_modified, matched_offsets = (
+        ...     fragment.update_columns_with_offsets(
+        ...         update_data,
+        ...         left_on="id",
+        ...         right_on="id",
+        ...     )
+        ... )
+        >>> op = LanceOperation.Update(
+        ...     updated_fragments=[metadata],
+        ...     fields_modified=fields_modified,
+        ...     update_mode="rewrite_columns",
+        ...     updated_fragment_offsets={metadata.id: matched_offsets},
+        ... )
+        >>> dataset = lance.LanceDataset.commit(
+        ...     "dataset",
+        ...     op,
+        ...     read_version=base_version
+        ... )
+        >>> dataset.to_table(
+        ...     columns=["id", "value", "_row_last_updated_at_version"]
+        ... ).to_pydict()
+        {'id': [1, 2], 'value': [100, 20], '_row_last_updated_at_version': [2, 1]}
+
+        See Also
+        --------
+        LanceFragment.update_columns :
+            The same operation, returning only the metadata and modified fields.
+        lance.dataset.LanceOperation.Update :
+            The operation used to commit these changes to the dataset.
+
+        Notes
+        -----
+        - The offsets are physical, 0-based offsets within this fragment. They are
+          not logical positions, ``_rowid`` values, or full ``_rowaddr`` values, so
+          a fragment carrying a deletion vector still reports the physical offset of
+          each matched row.
+        - The offsets are only consumed by commits that pass
+          ``update_mode="rewrite_columns"`` over a dataset with stable row IDs.
+          They are ignored for a fragment that has no row version metadata yet, and
+          an empty bitmap (no row matched the join) stamps nothing.
+        - This is a low-level API; for most use cases, use Dataset.update() instead
+        """
+        if right_on is None:
+            right_on = left_on
+
+        reader = _coerce_reader(data_obj, schema)
+        return self._fragment.update_columns_with_offsets(reader, left_on, right_on)
 
     def merge_columns(
         self,

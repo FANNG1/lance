@@ -570,6 +570,222 @@ def test_fragment_update_columns_basic(tmp_path):
     assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
 
 
+def _last_updated_versions(dataset) -> list:
+    return dataset.to_table(columns=["_row_last_updated_at_version"]).to_pydict()[
+        "_row_last_updated_at_version"
+    ]
+
+
+def test_fragment_update_columns_with_offsets_return_shape(tmp_path):
+    """The offsets variant adds a third element; the original stays a 2-tuple."""
+    data = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    dataset_uri = tmp_path / "test_update_columns_with_offsets_shape"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([0, 2], type=pa.uint64()),
+            "value": [100, 300],
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+    legacy = fragment.update_columns(update_data)
+    assert len(legacy) == 2
+
+    metadata, fields_modified, matched_offsets = fragment.update_columns_with_offsets(
+        update_data
+    )
+    assert metadata.id == fragment.fragment_id
+    assert isinstance(fields_modified, list)
+    assert len(fields_modified) > 0
+    # Portable RoaringBitmap bytes, consumable without a Roaring library on the
+    # caller's side.
+    assert isinstance(matched_offsets, bytes)
+    assert len(matched_offsets) > 0
+
+
+@pytest.mark.parametrize(
+    "pass_offsets",
+    [True, False],
+    ids=["with_offsets", "without_offsets"],
+)
+def test_fragment_update_columns_with_offsets_refreshes_row_versions(
+    tmp_path, pass_offsets
+):
+    """Passing offsets stamps exactly the matched rows; omitting them stamps none."""
+    data = pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]})
+    dataset_uri = tmp_path / "test_update_columns_with_offsets_versions"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+    base_version = dataset.version
+
+    update_data = pa.table(
+        {
+            "_rowaddr": pa.array([0, 2], type=pa.uint64()),
+            "value": pa.array([999, 777], type=pa.int64()),
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+    metadata, fields_modified, matched_offsets = fragment.update_columns_with_offsets(
+        update_data, left_on="_rowaddr", right_on="_rowaddr"
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[metadata],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets=(
+            {metadata.id: matched_offsets} if pass_offsets else None
+        ),
+    )
+    updated = lance.LanceDataset.commit(str(dataset_uri), op, read_version=base_version)
+
+    # The values land either way; only the row version metadata differs.
+    assert updated.to_table().to_pydict()["value"] == [999, 20, 777, 40]
+
+    updated_ids = updated.delta(base_version).get_updated_rows().read_all().to_pydict()
+    if pass_offsets:
+        assert _last_updated_versions(updated) == [
+            updated.version,
+            base_version,
+            updated.version,
+            base_version,
+        ]
+        assert updated_ids["id"] == [1, 3]
+    else:
+        # Without the offsets the rewritten rows silently leave the change feed --
+        # the regression this API exists to prevent.
+        assert _last_updated_versions(updated) == [base_version] * 4
+        assert updated_ids["id"] == []
+
+
+def test_fragment_update_columns_with_offsets_multiple_fragments(tmp_path):
+    """Each fragment reports its own bitmap, keyed by fragment id in one commit."""
+    data = pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]})
+    dataset_uri = tmp_path / "test_update_columns_with_offsets_multi_frag"
+    dataset = lance.write_dataset(
+        data, dataset_uri, max_rows_per_file=2, enable_stable_row_ids=True
+    )
+    base_version = dataset.version
+    assert len(dataset.get_fragments()) == 2
+
+    updated_fragments = []
+    fields_modified = []
+    offsets_by_fragment = {}
+    # Update the second row of fragment 0 and the first row of fragment 1.
+    for fragment, row_offset, new_value in [
+        (dataset.get_fragment(0), 1, 999),
+        (dataset.get_fragment(1), 0, 888),
+    ]:
+        update_data = pa.table(
+            {
+                "_rowaddr": pa.array(
+                    [(fragment.fragment_id << 32) + row_offset], type=pa.uint64()
+                ),
+                "value": pa.array([new_value], type=pa.int64()),
+            }
+        )
+        metadata, fields, matched_offsets = fragment.update_columns_with_offsets(
+            update_data, left_on="_rowaddr", right_on="_rowaddr"
+        )
+        updated_fragments.append(metadata)
+        fields_modified = fields
+        offsets_by_fragment[metadata.id] = matched_offsets
+
+    assert len(offsets_by_fragment) == 2
+
+    op = LanceOperation.Update(
+        updated_fragments=updated_fragments,
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets=offsets_by_fragment,
+    )
+    updated = lance.LanceDataset.commit(str(dataset_uri), op, read_version=base_version)
+
+    assert updated.to_table().to_pydict()["value"] == [10, 999, 888, 40]
+    assert _last_updated_versions(updated) == [
+        base_version,
+        updated.version,
+        updated.version,
+        base_version,
+    ]
+
+
+def test_fragment_update_columns_with_offsets_are_physical(tmp_path):
+    """With a deletion vector the offsets stay physical, not post-deletion logical."""
+    data = pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]})
+    dataset_uri = tmp_path / "test_update_columns_with_offsets_physical"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+    created_version = dataset.version
+    dataset.delete("id = 1")
+    base_version = dataset.version
+
+    # Physical offset 2, but logical position 1 once row 0 is deleted.
+    update_data = pa.table(
+        {
+            "_rowaddr": pa.array([2], type=pa.uint64()),
+            "value": pa.array([999], type=pa.int64()),
+        }
+    )
+    fragment = dataset.get_fragment(0)
+    metadata, fields_modified, matched_offsets = fragment.update_columns_with_offsets(
+        update_data, left_on="_rowaddr", right_on="_rowaddr"
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[metadata],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets={metadata.id: matched_offsets},
+    )
+    updated = lance.LanceDataset.commit(str(dataset_uri), op, read_version=base_version)
+
+    result = updated.to_table().to_pydict()
+    assert result["id"] == [2, 3, 4]
+    assert result["value"] == [20, 999, 40]
+    # A logical offset would have stamped id=3's neighbour instead.
+    assert _last_updated_versions(updated) == [
+        created_version,
+        updated.version,
+        created_version,
+    ]
+    assert updated.delta(base_version).get_updated_rows().read_all().to_pydict()[
+        "id"
+    ] == [3]
+
+
+def test_fragment_update_columns_with_offsets_no_match(tmp_path):
+    """No matched row yields a valid empty bitmap that stamps nothing."""
+    data = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    dataset_uri = tmp_path / "test_update_columns_with_offsets_no_match"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+    base_version = dataset.version
+
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([100, 200], type=pa.uint64()),
+            "value": pa.array([999, 888], type=pa.int64()),
+        }
+    )
+    fragment = dataset.get_fragment(0)
+    metadata, fields_modified, matched_offsets = fragment.update_columns_with_offsets(
+        update_data
+    )
+    assert isinstance(matched_offsets, bytes)
+
+    op = LanceOperation.Update(
+        updated_fragments=[metadata],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets={metadata.id: matched_offsets},
+    )
+    updated = lance.LanceDataset.commit(str(dataset_uri), op, read_version=base_version)
+
+    assert updated.to_table().to_pydict()["value"] == [10, 20, 30]
+    assert _last_updated_versions(updated) == [base_version] * 3
+
+
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
     """Test fragment update columns with custom join key."""
     # Create initial dataset

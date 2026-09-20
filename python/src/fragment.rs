@@ -33,7 +33,7 @@ use lance_table::format::{
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBytes, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
@@ -411,6 +411,37 @@ impl FileFragment {
             .infer_error()?;
 
         Ok((PyLance(updated_fragment), fields_modified))
+    }
+
+    fn update_columns_with_offsets(
+        &mut self,
+        py: Python<'_>,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        left_on: String,
+        right_on: String,
+    ) -> PyResult<(PyLance<Fragment>, Vec<u32>, Py<PyBytes>)> {
+        let mut fragment = self.fragment.clone();
+        let result = rt()
+            .spawn(None, async move {
+                fragment
+                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .await
+            })?
+            .infer_error()?;
+
+        let mut offsets = Vec::with_capacity(result.matched_offsets.serialized_size());
+        result
+            .matched_offsets
+            .serialize_into(&mut offsets)
+            .map_err(|err| {
+                PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
+            })?;
+
+        Ok((
+            PyLance(result.fragment),
+            result.fields_modified,
+            PyBytes::new(py, &offsets).unbind(),
+        ))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
