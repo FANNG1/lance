@@ -2879,10 +2879,11 @@ impl Dataset {
         Ok(fragments.into_iter().flatten().collect())
     }
 
-    pub(crate) fn get_existing_fragments_from_ids(
-        &self,
-        fragment_ids: &[u32],
-    ) -> Vec<FileFragment> {
+    /// The fragments for `fragment_ids` that exist in this version, in ascending id order.
+    ///
+    /// Unknown ids are skipped rather than rejected, unlike
+    /// [`Self::get_fragments_from_ids`].
+    pub fn get_existing_fragments_from_ids(&self, fragment_ids: &[u32]) -> Vec<FileFragment> {
         let ordered_ids = Self::normalize_fragment_ids(fragment_ids);
         self.get_frags_from_ordered_ids(&ordered_ids)
             .into_iter()

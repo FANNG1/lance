@@ -1617,6 +1617,64 @@ def test_get_fragments(tmp_path: Path):
     assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})
 
 
+def test_get_fragments_with_filter(tmp_path: Path):
+    # Five fragments of two rows each: fragment i holds a == 2i and 2i + 1.
+    lance.write_dataset(pa.table({"a": range(10)}), tmp_path, max_rows_per_file=2)
+    dataset = lance.dataset(tmp_path)
+
+    def candidate_ids(filter):
+        return sorted(f.fragment_id for f in dataset.get_fragments(filter=filter))
+
+    def matching_ids(filter):
+        addrs = dataset.to_table(filter=filter, columns=[], with_row_address=True)
+        return sorted({addr >> 32 for addr in addrs["_rowaddr"].to_pylist()})
+
+    # Without an index nothing can be ruled out.
+    assert candidate_ids("a < 3") == [0, 1, 2, 3, 4]
+
+    dataset.create_scalar_index("a", "BTREE")
+    dataset = lance.dataset(tmp_path)
+
+    for filter in ["a < 3", "a = 7", "a > 100", "a < 1 OR a > 8"]:
+        candidates = candidate_ids(filter)
+        assert set(matching_ids(filter)).issubset(candidates), filter
+        assert len(candidates) < 5, filter
+
+    # A pyarrow expression goes through substrait and must agree with the string form.
+    assert candidate_ids(pa.compute.field("a") < 3) == candidate_ids("a < 3")
+
+    # No filter still returns everything.
+    assert sorted(f.fragment_id for f in dataset.get_fragments()) == [0, 1, 2, 3, 4]
+
+    # A filter on an unindexed column cannot prune.
+    lance.write_dataset(
+        pa.table({"a": range(10), "b": range(10)}),
+        tmp_path / "two_cols",
+        max_rows_per_file=2,
+    )
+    unindexed = lance.dataset(tmp_path / "two_cols")
+    unindexed.create_scalar_index("a", "BTREE")
+    unindexed = lance.dataset(tmp_path / "two_cols")
+    assert sorted(f.fragment_id for f in unindexed.get_fragments(filter="b < 3")) == [
+        0,
+        1,
+        2,
+        3,
+        4,
+    ]
+
+    with pytest.raises(TypeError, match="must be a str"):
+        dataset.get_fragments(filter=3)
+
+
+def test_candidate_fragments_rejects_both_filters(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(4)}), tmp_path, max_rows_per_file=2)
+    dataset = lance.dataset(tmp_path)
+
+    with pytest.raises(ValueError, match="only one of filter or substrait_filter"):
+        dataset._ds.candidate_fragments(filter="a < 2", substrait_filter=b"ignored")
+
+
 def test_fragment_ids(tmp_path: Path):
     lance.write_dataset(pa.table({"a": range(10)}), tmp_path, max_rows_per_file=2)
     dataset = lance.dataset(tmp_path)

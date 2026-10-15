@@ -3018,6 +3018,44 @@ impl Dataset {
             .map(PyLance)
     }
 
+    /// The fragments that may contain a row matching `filter`.
+    ///
+    /// The result is a superset of the fragments that actually hold a matching row; see
+    /// `Scanner::candidate_fragment_ids`. `filter` and `substrait_filter` are mutually
+    /// exclusive.
+    #[pyo3(signature=(filter=None, substrait_filter=None))]
+    fn candidate_fragments(
+        self_: PyRef<'_, Self>,
+        filter: Option<String>,
+        substrait_filter: Option<Vec<u8>>,
+    ) -> PyResult<Vec<FileFragment>> {
+        if filter.is_some() && substrait_filter.is_some() {
+            return Err(PyValueError::new_err(
+                "only one of filter or substrait_filter can be set",
+            ));
+        }
+
+        let mut scanner = self_.ds.scan();
+        if let Some(filter) = filter.as_deref() {
+            scanner.filter(filter).infer_error()?;
+        } else if let Some(substrait_filter) = substrait_filter.as_deref() {
+            scanner.filter_substrait(substrait_filter).infer_error()?;
+        }
+
+        let fragment_ids = rt()
+            .block_on(Some(self_.py()), scanner.candidate_fragment_ids())?
+            .infer_error()?
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        Ok(self_
+            .ds
+            .get_existing_fragments_from_ids(&fragment_ids)
+            .into_iter()
+            .map(FileFragment::new)
+            .collect())
+    }
+
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
         let core_fragments = self_.ds.get_fragments();
 

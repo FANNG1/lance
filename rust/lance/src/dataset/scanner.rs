@@ -7,6 +7,7 @@ use datafusion::config::ConfigOptions;
 use lance_select::result::IndexExprResultWireFormat;
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
@@ -16,6 +17,7 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
+use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
@@ -70,11 +72,12 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
-use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::expression::PlannerIndexExt;
-use lance_index::scalar::expression::ScalarIndexExpr;
+use lance_index::scalar::expression::{ScalarIndexExpr, ScalarIndexLoader};
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator,
     PhraseQuery, fill_fts_query_column,
@@ -88,7 +91,7 @@ use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, ProbeParams, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_select::IndexExprResult;
+use lance_select::{IndexExprResult, NullableIndexExprResult, RowAddrSelection};
 // Re-exported so callers of `Scanner::with_row_id_prefilter` can name the mask
 // type without depending on `lance-select` directly.
 pub use super::fragment_slice::FragmentSlice;
@@ -111,7 +114,9 @@ use crate::index::scalar::inverted::{
     resolve_fts_field, resolve_query_document_granularity, validate_combined_fields_target_column,
 };
 use crate::index::scalar::{IndexDetails, fetch_index_details};
-use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
+use crate::index::scalar_logical::{
+    load_named_scalar_segments, open_scalar_index_segments, scalar_index_fragment_bitmap,
+};
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -784,6 +789,69 @@ impl FilterPlan {
         }
 
         Ok(plan)
+    }
+}
+
+/// A [`ScalarIndexLoader`] that keeps index results in the row-address domain.
+///
+/// The read path translates address-domain results into row ids because a scan emits row
+/// ids. Fragment pruning needs the opposite: in the address domain a mask key *is* the
+/// fragment id, so the candidate fragment set falls out of the mask with no per-fragment
+/// I/O. Translating first would force a `RowIdSequence` load per fragment to get back
+/// what the untranslated mask already says.
+struct AddressDomainIndexLoader<'a> {
+    dataset: &'a Dataset,
+    /// Coverage scope; only index segments intersecting these fragments are opened.
+    fragments: &'a RoaringBitmap,
+    /// Set when a leaf answers in the row-id domain on a stable-row-id table. Its mask keys
+    /// are stable row ids rather than addresses, and the two domains cannot be combined by
+    /// the boolean algebra, so the whole result is discarded rather than degraded per leaf.
+    saw_row_id_domain_leaf: AtomicBool,
+}
+
+impl<'a> AddressDomainIndexLoader<'a> {
+    fn new(dataset: &'a Dataset, fragments: &'a RoaringBitmap) -> Self {
+        Self {
+            dataset,
+            fragments,
+            saw_row_id_domain_leaf: AtomicBool::new(false),
+        }
+    }
+
+    fn saw_row_id_domain_leaf(&self) -> bool {
+        self.saw_row_id_domain_leaf.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl ScalarIndexLoader for AddressDomainIndexLoader<'_> {
+    async fn load_index(
+        &self,
+        column: &str,
+        index_name: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let index = open_scalar_index_segments(
+            self.dataset,
+            column,
+            index_name,
+            Some(self.fragments),
+            None,
+            metrics,
+        )
+        .await?;
+        if self.dataset.manifest.uses_stable_row_ids() && !index.results_are_row_addresses() {
+            self.saw_row_id_domain_leaf.store(true, Ordering::Relaxed);
+        }
+        Ok(index)
+    }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        // Deliberately the identity: staying in the address domain is the whole point.
+        Ok(result)
     }
 }
 
@@ -3552,6 +3620,93 @@ impl Scanner {
         }
 
         Ok(filter_plan)
+    }
+
+    /// The fragments that may contain a row matching this scanner's filter.
+    ///
+    /// The result is a **superset** of the fragments that actually contain a matching row: a
+    /// fragment is pruned only when a scalar index proves it cannot contain one. Fragments no
+    /// index covers are always kept, so the answer never misses a match, but a returned
+    /// fragment is not guaranteed to hold one.
+    ///
+    /// Only index and manifest metadata are read; data columns are never scanned. This lets a
+    /// distributed engine cut its task count before planning a scan, instead of emitting one
+    /// task per fragment over a table with a very large number of fragments.
+    ///
+    /// Every fragment is returned (no pruning) when no index can answer any part of the
+    /// filter, when the index result is a block list (which may select rows in any fragment),
+    /// and when a table using stable row ids has a legacy index that answers in the row-id
+    /// domain rather than the row-address domain.
+    ///
+    /// Vector, full-text, and MinHash searches are rejected: candidate fragments are only
+    /// defined for a scalar filter.
+    pub async fn candidate_fragment_ids(&self) -> Result<RoaringBitmap> {
+        if self.nearest.is_some() || self.full_text_query.is_some() || self.minhash_query.is_some()
+        {
+            return Err(Error::not_supported(
+                "candidate fragments are only defined for a scalar filter, not for vector, \
+                 full-text, or MinHash search"
+                    .to_string(),
+            ));
+        }
+
+        let target_fragments = self.get_fragments_as_bitmap();
+        let filter_plan = self.create_filter_plan(true, None, None).await?;
+        let Some(index_query) = filter_plan.expr_filter_plan.index_query.as_ref() else {
+            // No index can answer any part of the filter, so nothing can be ruled out.
+            return Ok(target_fragments);
+        };
+
+        let covered = self.fragments_covered_by_index_query(index_query).await? & &target_fragments;
+        if covered.is_empty() {
+            // Nothing in scope is indexed, so there is nothing to evaluate the index against.
+            return Ok(target_fragments);
+        }
+        // Fragments outside the index's coverage must be kept: the index has nothing to say
+        // about them. Typically these are fragments appended after the index was built.
+        let uncovered = &target_fragments - &covered;
+
+        // A row whose data overlay was committed after the index it relies on can no longer be
+        // judged by that index, so its fragment has to stay a candidate even if the index
+        // claims the fragment holds no match.
+        let scoped_fragments: &[Fragment] = match self.fragments.as_ref() {
+            Some(fragments) => fragments,
+            None => self.dataset.fragments(),
+        };
+        let stale_fragments = self
+            .overlay_stale_index_rows(index_query, scoped_fragments)
+            .await?
+            .into_iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(fragment_id, _)| fragment_id)
+            .collect::<RoaringBitmap>()
+            & &target_fragments;
+
+        let loader = AddressDomainIndexLoader::new(self.dataset.as_ref(), &covered);
+        let index_result = index_query.evaluate(&loader, &NoOpMetricsCollector).await?;
+        if loader.saw_row_id_domain_leaf() {
+            // The mask is keyed by stable row ids, not fragment ids, so it cannot prune.
+            return Ok(target_fragments);
+        }
+
+        // `upper` is the set of rows that *may* match, which is exactly the superset semantics
+        // this API promises; `lower` would only hold guaranteed matches and could prune a
+        // fragment holding a candidate row.
+        let indexed_candidates = match index_result.upper.allow_list() {
+            Some(rows) => {
+                rows.iter()
+                    .filter(|(_, selection)| {
+                        !matches!(selection, RowAddrSelection::Partial(rows) if rows.is_empty())
+                    })
+                    .map(|(fragment_id, _)| *fragment_id)
+                    .collect::<RoaringBitmap>()
+                    & &covered
+            }
+            // A block list may select rows in any fragment, so it cannot prune.
+            None => covered,
+        };
+
+        Ok(indexed_candidates | uncovered | stale_fragments)
     }
 
     fn requested_scan_range(&self, total_rows: u64) -> Option<Range<u64>> {
