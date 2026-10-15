@@ -12,6 +12,7 @@ use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, StructArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_array::{Int64Array, UInt64Array};
@@ -44,6 +45,14 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 use rstest::rstest;
+
+use super::dataset_overlay_index_masking::{commit_overlay, create_base_dataset_with};
+use lance_core::ROW_ADDR;
+use lance_core::utils::address::RowAddress;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::minhash_lsh::MinHashQuery;
+use lance_table::format::overlay::OverlayCoverage;
+use roaring::RoaringBitmap;
 
 /// A null struct must not read back as a valid struct with null children.
 ///
@@ -1051,4 +1060,234 @@ async fn check_results(
         .downcast_ref::<Int32Array>()
         .unwrap();
     assert_eq!(ids.values(), expected_ids);
+}
+
+/// Fragment ids that actually hold a row matching `filter`, from a full (unindexed) scan.
+///
+/// `candidate_fragment_ids` promises a superset of this, so every pruning test asserts
+/// against it rather than against a hand-written id list: an implementation bug then shows
+/// up as a missing fragment instead of silently passing.
+async fn fragments_with_matching_rows(dataset: &Dataset, filter: &str) -> RoaringBitmap {
+    let batches = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .project::<&str>(&[])
+        .unwrap()
+        .with_row_address()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .map(|addr| RowAddress::from(*addr).fragment_id())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+async fn candidate_fragments(dataset: &Dataset, filter: &str) -> RoaringBitmap {
+    let mut scanner = dataset.scan();
+    scanner.filter(filter).unwrap();
+    scanner.candidate_fragment_ids().await.unwrap()
+}
+
+async fn build_age_btree(dataset: &mut Dataset) {
+    dataset
+        .create_index(
+            &["age"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+}
+
+/// Without a scalar index nothing can be ruled out, so every fragment stays a candidate.
+#[tokio::test]
+async fn test_candidate_fragments_without_index_returns_all() {
+    let dataset = create_base_dataset_with(false).await;
+
+    let candidates = candidate_fragments(&dataset, "age < 25").await;
+
+    assert_eq!(candidates, dataset.fragment_bitmap().as_ref().clone());
+    assert!(candidates.contains(0) && candidates.contains(1));
+}
+
+/// A btree index prunes the fragment whose values cannot match. `age = id * 10`, six rows
+/// per fragment, so fragment 0 holds ages 0..=50 and fragment 1 holds 60..=110.
+#[rstest]
+#[case::only_first_fragment("age < 25", &[0])]
+#[case::only_second_fragment("age > 95", &[1])]
+#[case::both_fragments("age = 20 OR age = 100", &[0, 1])]
+#[case::matches_nothing("age = 7", &[])]
+#[tokio::test]
+async fn test_candidate_fragments_prunes_with_btree(
+    #[case] filter: &str,
+    #[case] expected: &[u32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_btree(&mut dataset).await;
+
+    let candidates = candidate_fragments(&dataset, filter).await;
+
+    // The headline guarantee: an address-domain btree prunes even on a stable-row-id table.
+    assert_eq!(
+        candidates,
+        RoaringBitmap::from_iter(expected.iter().copied()),
+        "filter {filter:?} with stable_row_ids={stable_row_ids}"
+    );
+    let matching = fragments_with_matching_rows(&dataset, filter).await;
+    assert!(
+        matching.is_subset(&candidates),
+        "filter {filter:?} pruned a fragment holding a match: candidates={candidates:?}, matching={matching:?}"
+    );
+}
+
+/// A fragment appended after the index was built is outside its coverage, so it has to be
+/// kept even though the index can prune the fragments it does cover.
+#[tokio::test]
+async fn test_candidate_fragments_keeps_uncovered_fragments() {
+    let mut dataset = create_base_dataset_with(false).await;
+    build_age_btree(&mut dataset).await;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("age", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(12..18)),
+            Arc::new(Int32Array::from_iter_values((12..18).map(|v| v * 10))),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    // Fragment 0 (ages 0..=50) is covered and provably has no match; fragment 2 is the new
+    // one, which the index does not cover.
+    let candidates = candidate_fragments(&dataset, "age > 95").await;
+
+    assert_eq!(candidates, RoaringBitmap::from_iter([1, 2]));
+    let matching = fragments_with_matching_rows(&dataset, "age > 95").await;
+    assert!(matching.is_subset(&candidates));
+}
+
+/// Scoping the scan to fragments the index does not cover leaves nothing to evaluate the
+/// index against, so every scoped fragment stays a candidate.
+#[tokio::test]
+async fn test_candidate_fragments_scoped_outside_index_coverage() {
+    let mut dataset = create_base_dataset_with(false).await;
+    build_age_btree(&mut dataset).await;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("age", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(12..18)),
+            Arc::new(Int32Array::from_iter_values((12..18).map(|v| v * 10))),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    let appended = dataset.get_fragment(2).unwrap().metadata().clone();
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(vec![appended]);
+    // `age = 7` matches nothing, but the index covers neither fragment in scope.
+    scanner.filter("age = 7").unwrap();
+
+    assert_eq!(
+        scanner.candidate_fragment_ids().await.unwrap(),
+        RoaringBitmap::from_iter([2])
+    );
+}
+
+/// A negated predicate evaluates to a block list, which may select rows in any fragment,
+/// so no fragment can be pruned.
+#[tokio::test]
+async fn test_candidate_fragments_block_list_is_not_prunable() {
+    let mut dataset = create_base_dataset_with(false).await;
+    build_age_btree(&mut dataset).await;
+
+    let filter = "age NOT IN (0, 10, 20, 30, 40, 50)";
+    let candidates = candidate_fragments(&dataset, filter).await;
+
+    assert_eq!(candidates, RoaringBitmap::from_iter([0, 1]));
+    let matching = fragments_with_matching_rows(&dataset, filter).await;
+    assert!(matching.is_subset(&candidates));
+}
+
+/// A row rewritten by an overlay committed after the index can no longer be judged by that
+/// index, so its fragment stays a candidate even when the index says it holds no match.
+#[tokio::test]
+async fn test_candidate_fragments_keeps_overlay_stale_fragment() {
+    let mut dataset = create_base_dataset_with(false).await;
+    build_age_btree(&mut dataset).await;
+
+    // Fragment 0's indexed ages are 0..=50, so the index would prune it for `age > 95`.
+    // The overlay (committed after the index) changes offset 1's age to 999, which matches.
+    let overlaid_age: ArrayRef = Arc::new(Int32Array::from(vec![999]));
+    let dataset = commit_overlay(
+        dataset,
+        "stale_age",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![overlaid_age],
+    )
+    .await;
+
+    let candidates = candidate_fragments(&dataset, "age > 95").await;
+
+    assert!(
+        candidates.contains(0),
+        "fragment 0 was pruned despite a stale overlay row that matches: {candidates:?}"
+    );
+    let matching = fragments_with_matching_rows(&dataset, "age > 95").await;
+    assert!(matching.is_subset(&candidates));
+}
+
+/// Candidate fragments are only defined for a scalar filter.
+#[tokio::test]
+async fn test_candidate_fragments_rejects_search_queries() {
+    let dataset = create_base_dataset_with(false).await;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new("hello".to_string()))
+        .unwrap();
+    assert!(matches!(
+        scanner.candidate_fragment_ids().await,
+        Err(Error::NotSupported { .. })
+    ));
+
+    let mut scanner = dataset.scan();
+    scanner
+        .minhash_search(MinHashQuery::new("hello", "id"))
+        .unwrap();
+    assert!(matches!(
+        scanner.candidate_fragment_ids().await,
+        Err(Error::NotSupported { .. })
+    ));
 }

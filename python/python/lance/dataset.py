@@ -2088,16 +2088,62 @@ class LanceDataset(pa.dataset.Dataset):
         # Use the new path-based Rust function directly
         self._ds.update_field_metadata_by_path(field_updates, replace=replace)
 
-    def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
-        """Get all fragments from the dataset.
+    def get_fragments(
+        self, filter: Optional[Union[str, Expression]] = None
+    ) -> List[LanceFragment]:
+        """Get the fragments of the dataset.
 
-        Note: filter is not supported yet.
+        Without a ``filter`` every fragment is returned. With one, only fragments
+        that may contain a matching row are returned.
+
+        The filtered result is a **superset** of the fragments that actually hold a
+        matching row: a fragment is pruned only when a scalar index proves it cannot
+        hold one, so fragments no index covers are always kept. Only index and
+        manifest metadata are read -- data columns are never scanned -- which lets a
+        distributed engine cut its task count before planning a scan instead of
+        emitting one task per fragment.
+
+        Every fragment is returned when no index can answer any part of the filter.
+
+        Parameters
+        ----------
+        filter : str or pa.compute.Expression, optional
+            Filter used to prune fragments. A returned fragment is not guaranteed to
+            hold a matching row.
+
+        Returns
+        -------
+        List[LanceFragment]
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": range(8)})
+        >>> dataset = lance.write_dataset(
+        ...     data, "memory://candidate_fragments", max_rows_per_file=4
+        ... )
+        >>> [f.fragment_id for f in dataset.get_fragments()]
+        [0, 1]
+        >>> dataset.create_scalar_index("x", "BTREE")
+        >>> [f.fragment_id for f in dataset.get_fragments(filter="x < 2")]
+        [0]
         """
-        if filter is not None:
-            raise ValueError("get_fragments() does not support filter yet")
+        if filter is None:
+            raw_fragments = self._ds.get_fragments()
+        elif isinstance(filter, str):
+            raw_fragments = self._ds.candidate_fragments(filter=filter)
+        elif isinstance(filter, pa.compute.Expression):
+            raw_fragments = self._ds.candidate_fragments(
+                substrait_filter=_serialize_expression(filter, self._ds.schema)
+            )
+        else:
+            raise TypeError(
+                "get_fragments() filter must be a str or a pyarrow compute "
+                f"Expression, got {type(filter)}"
+            )
         return [
-            LanceFragment(self, fragment_id=None, fragment=f)
-            for f in self._ds.get_fragments()
+            LanceFragment(self, fragment_id=None, fragment=f) for f in raw_fragments
         ]
 
     def fragment_ids(self) -> Bitmap:
