@@ -12,6 +12,7 @@ use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, StructArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_array::{Int64Array, UInt64Array};
@@ -19,25 +20,31 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
+use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::tempfile::TempStrDir;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
-use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     SCORE_FIELD,
     query::{FtsQuery, MatchQuery, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
+use lance_index::scalar::minhash_lsh::MinHashQuery;
+use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexParams};
 use lance_index::{IndexType, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use crate::dataset::DATA_DIR;
 use crate::dataset::NewColumnTransform;
-use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
-use crate::dataset::write::WriteParams;
+use crate::dataset::scanner::{DatasetRecordBatchStream, FragmentCandidates, QueryFilter};
+use crate::dataset::write::{WriteMode, WriteParams};
 use crate::{Dataset, Error};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -1051,4 +1058,423 @@ async fn check_results(
         .downcast_ref::<Int32Array>()
         .unwrap();
     assert_eq!(ids.values(), expected_ids);
+}
+
+// ---------------------------------------------------------------------------
+// Scanner::candidate_fragments
+// ---------------------------------------------------------------------------
+
+/// Four fragments of 100 rows with disjoint `value` ranges (fragment `i` holds
+/// `i * 100 .. i * 100 + 100`), optionally indexed on `value`, then a fifth fragment
+/// appended *after* indexing so it is genuinely outside the index's coverage.
+async fn candidate_fragment_fixture(
+    index: Option<IndexType>,
+    enable_stable_row_ids: bool,
+) -> (Dataset, TempStrDir) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("value", DataType::Int32, true),
+        ArrowField::new("other", DataType::Int32, true),
+    ]));
+    let batch = |range: std::ops::Range<i32>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(range.clone())),
+                Arc::new(Int32Array::from_iter_values(range)),
+            ],
+        )
+        .unwrap()
+    };
+
+    let test_dir = TempStrDir::default();
+    let params = WriteParams {
+        max_rows_per_file: 100,
+        enable_stable_row_ids,
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(batch(0..400))], schema.clone());
+    let mut dataset = Dataset::write(reader, &test_dir, Some(params.clone()))
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    // The row-id mode is the axis these tests turn on, so assert the premise rather than
+    // trusting the write param: an index answering in the row-id domain can only be
+    // distinguished from one answering in the address domain if this actually took effect.
+    assert_eq!(
+        dataset.manifest.uses_stable_row_ids(),
+        enable_stable_row_ids,
+        "fixture did not produce the requested row-id mode"
+    );
+
+    if let Some(index_type) = index {
+        let builtin = match index_type {
+            IndexType::BTree => BuiltinIndexType::BTree,
+            IndexType::ZoneMap => BuiltinIndexType::ZoneMap,
+            other => panic!("fixture does not build {other} indices"),
+        };
+        dataset
+            .create_index(
+                &["value"],
+                index_type,
+                None,
+                &ScalarIndexParams::for_builtin(builtin),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    let append = WriteParams {
+        mode: WriteMode::Append,
+        ..params
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(batch(400..500))], schema);
+    let dataset = Dataset::write(reader, &test_dir, Some(append))
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 5);
+    assert_eq!(
+        dataset.manifest.uses_stable_row_ids(),
+        enable_stable_row_ids,
+        "append must preserve the row-id mode"
+    );
+    (dataset, test_dir)
+}
+
+fn frag_set(ids: impl IntoIterator<Item = u32>) -> RoaringBitmap {
+    ids.into_iter().collect()
+}
+
+/// The fragments that really hold a row matching `filter`, from an actual scan.
+///
+/// Pruning may only drop a fragment that holds no match, so this set must always be a
+/// subset of [`FragmentCandidates::to_scan`]. Without this cross-check a test could pass
+/// while the API silently lost rows.
+async fn matching_fragments(dataset: &Dataset, filter: &str) -> RoaringBitmap {
+    let batch = dataset
+        .scan()
+        .with_row_address()
+        .filter(filter)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    batch[ROW_ADDR]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .map(|addr| RowAddress::from(*addr).fragment_id())
+        .collect()
+}
+
+async fn candidates_for(dataset: &Dataset, filter: &str) -> FragmentCandidates {
+    let mut scan = dataset.scan();
+    scan.filter(filter).unwrap();
+    let candidates = scan.candidate_fragments().await.unwrap();
+    assert!(
+        (&candidates.hits & &candidates.unknown).is_empty(),
+        "hits and unknown must be disjoint: {candidates:?}"
+    );
+    let matching = matching_fragments(dataset, filter).await;
+    assert!(
+        (&matching - &candidates.to_scan()).is_empty(),
+        "pruning lost fragments that hold matching rows: matching={matching:?} \
+         candidates={candidates:?}"
+    );
+    candidates
+}
+
+/// With no index nothing can be ruled out, so every fragment is unjudged.
+#[tokio::test]
+async fn test_candidate_fragments_without_index() {
+    let (dataset, _dir) = candidate_fragment_fixture(None, false).await;
+    let candidates = candidates_for(&dataset, "value = 150").await;
+    assert_eq!(candidates.hits, RoaringBitmap::new());
+    assert_eq!(candidates.unknown, frag_set(0..5));
+}
+
+/// The core pruning assertion, across the index types and both row-id modes.
+///
+/// Every index type a current writer produces answers in the row-address domain -- a zone
+/// map always, and a BTree at `BTREE_ROW_ADDR_DOMAIN_VERSION` and later -- so pruning
+/// works in both row-id modes. The row-id mode is parameterized anyway because it decides
+/// whether a mask key coincides with a fragment id by accident (addresses) or has to be
+/// kept in the address domain on purpose (stable row ids): a regression that translated
+/// results to row ids would still pass the address cases and fail the stable ones.
+#[rstest]
+#[case::btree_addr(IndexType::BTree, false)]
+#[case::btree_stable(IndexType::BTree, true)]
+#[case::zonemap_addr(IndexType::ZoneMap, false)]
+#[case::zonemap_stable(IndexType::ZoneMap, true)]
+#[tokio::test]
+async fn test_candidate_fragments_prunes(
+    #[case] index_type: IndexType,
+    #[case] enable_stable_row_ids: bool,
+) {
+    let (dataset, _dir) = candidate_fragment_fixture(Some(index_type), enable_stable_row_ids).await;
+    let candidates = candidates_for(&dataset, "value = 150").await;
+
+    // Only fragment 1 holds value 150; fragment 4 was appended after indexing.
+    assert_eq!(candidates.hits, frag_set([1]));
+    assert_eq!(candidates.unknown, frag_set([4]));
+    assert_eq!(candidates.to_scan(), frag_set([1, 4]));
+}
+
+/// A zone map answers `AtMost`, whose `lower` bound is empty. Pruning on `lower` instead
+/// of `upper` would report no candidates at all for a filter that does match.
+#[tokio::test]
+async fn test_candidate_fragments_inexact_index_uses_upper_bound() {
+    let (dataset, _dir) = candidate_fragment_fixture(Some(IndexType::ZoneMap), false).await;
+    let candidates = candidates_for(&dataset, "value >= 150 AND value < 250").await;
+    assert_eq!(candidates.hits, frag_set([1, 2]));
+    assert!(
+        !candidates.hits.is_empty(),
+        "upper bound must admit matches"
+    );
+}
+
+/// A fully deleted fragment holds no row, so it belongs to neither set even though the
+/// index still covers it and its summaries still claim its old values.
+#[tokio::test]
+async fn test_candidate_fragments_skips_fully_deleted_fragment() {
+    let (mut dataset, _dir) = candidate_fragment_fixture(Some(IndexType::ZoneMap), false).await;
+    dataset
+        .delete("value >= 100 AND value < 200")
+        .await
+        .unwrap();
+
+    let candidates = candidates_for(&dataset, "value = 150").await;
+    assert!(
+        !candidates.to_scan().contains(1),
+        "a fully deleted fragment must not be a candidate: {candidates:?}"
+    );
+    assert_eq!(candidates.hits, RoaringBitmap::new());
+    assert_eq!(candidates.unknown, frag_set([4]));
+}
+
+/// `NOT` over an exact index yields a block-list `upper`, which may select rows in any
+/// fragment and therefore cannot prune.
+#[tokio::test]
+async fn test_candidate_fragments_block_list_is_not_prunable() {
+    let (dataset, _dir) = candidate_fragment_fixture(Some(IndexType::BTree), false).await;
+    let candidates = candidates_for(&dataset, "value != 150").await;
+    assert_eq!(candidates.hits, frag_set(0..4));
+    assert_eq!(candidates.unknown, frag_set([4]));
+}
+
+/// An `OR` whose other side has no index cannot be answered by the index at all, so the
+/// filter falls back to a refine-only plan and nothing is pruned.
+#[tokio::test]
+async fn test_candidate_fragments_or_with_unindexed_column() {
+    let (dataset, _dir) = candidate_fragment_fixture(Some(IndexType::BTree), false).await;
+    let candidates = candidates_for(&dataset, "value = 150 OR other = 250").await;
+    assert_eq!(candidates.hits, RoaringBitmap::new());
+    assert_eq!(candidates.unknown, frag_set(0..5));
+}
+
+/// A predicate part the index could not absorb is ignored for pruning, so a fragment can
+/// be reported as a hit while holding no actual match. Documents the over-approximation.
+#[tokio::test]
+async fn test_candidate_fragments_over_reports_when_refine_remains() {
+    let (dataset, _dir) = candidate_fragment_fixture(Some(IndexType::BTree), false).await;
+    let filter = "value = 150 AND other = 999";
+    assert!(
+        matching_fragments(&dataset, filter).await.is_empty(),
+        "filter must match nothing for this test to mean anything"
+    );
+    let candidates = candidates_for(&dataset, filter).await;
+    assert_eq!(candidates.hits, frag_set([1]));
+}
+
+/// NULL edge cases: a fragment with no nulls must be excluded by `IS NULL`, and an
+/// all-null fragment must be admitted.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::zonemap(IndexType::ZoneMap)]
+#[tokio::test]
+async fn test_candidate_fragments_is_null(#[case] index_type: IndexType) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        DataType::Int32,
+        true,
+    )]));
+    // Fragment 0 has no nulls, fragment 1 is entirely null.
+    let values = (0..100)
+        .map(Some)
+        .chain((0..100).map(|_| None))
+        .collect::<Int32Array>();
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+    let test_dir = TempStrDir::default();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        &test_dir,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let builtin = match index_type {
+        IndexType::BTree => BuiltinIndexType::BTree,
+        _ => BuiltinIndexType::ZoneMap,
+    };
+    dataset
+        .create_index(
+            &["value"],
+            index_type,
+            None,
+            &ScalarIndexParams::for_builtin(builtin),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let candidates = candidates_for(&dataset, "value IS NULL").await;
+    assert_eq!(candidates.hits, frag_set([1]));
+    assert_eq!(candidates.unknown, RoaringBitmap::new());
+}
+
+/// Candidate fragments are only defined for a scalar filter.
+#[tokio::test]
+async fn test_candidate_fragments_rejects_search_queries() {
+    let (dataset, _dir) = candidate_fragment_fixture(Some(IndexType::BTree), false).await;
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new("hello".to_string()))
+        .unwrap();
+    let error = scan.candidate_fragments().await.unwrap_err();
+    assert!(
+        matches!(error, Error::NotSupported { .. }),
+        "expected NotSupported, got {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("only defined for a scalar filter"),
+        "{error}"
+    );
+
+    let mut scan = dataset.scan();
+    scan.minhash_search(MinHashQuery::new("value", "value"))
+        .unwrap();
+    assert!(matches!(
+        scan.candidate_fragments().await,
+        Err(Error::NotSupported { .. })
+    ));
+}
+
+/// The contract of this API: the answer comes from index and manifest data, never from a
+/// data file.
+///
+/// The negative control matters as much as the assertion -- without it, a refactor that
+/// made `candidate_fragments` return early would still pass. The fixture asserts the
+/// row-id lineage is inline, because a dataset that spills lineage into a data column
+/// would read a data file for a legitimate reason and invalidate the premise.
+#[rstest]
+#[case::addr(false)]
+#[case::stable(true)]
+#[tokio::test]
+async fn test_candidate_fragments_reads_no_data_files(#[case] enable_stable_row_ids: bool) {
+    let (dataset, _dir) =
+        candidate_fragment_fixture(Some(IndexType::ZoneMap), enable_stable_row_ids).await;
+    for fragment in dataset.get_fragments() {
+        assert!(
+            !fragment.metadata().has_spilled_row_lineage(),
+            "fixture must keep row-id lineage out of a data file"
+        );
+    }
+    let data_prefix = format!("/{DATA_DIR}/");
+
+    let _ = dataset.object_store.io_stats_incremental();
+    let candidates = dataset
+        .scan()
+        .filter("value = 150")
+        .unwrap()
+        .candidate_fragments()
+        .await
+        .unwrap();
+    assert_eq!(candidates.hits, frag_set([1]));
+    let pruning_reads = dataset
+        .object_store
+        .io_stats_incremental()
+        .requests
+        .into_iter()
+        .filter(|request| request.path.as_ref().contains(&data_prefix))
+        .collect::<Vec<_>>();
+    assert!(
+        pruning_reads.is_empty(),
+        "candidate_fragments must not read data files: {pruning_reads:#?}"
+    );
+
+    // Negative control: the equivalent scan does read data files.
+    let _ = dataset.object_store.io_stats_incremental();
+    dataset
+        .scan()
+        .filter("value = 150")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let scan_reads = dataset
+        .object_store
+        .io_stats_incremental()
+        .requests
+        .into_iter()
+        .filter(|request| request.path.as_ref().contains(&data_prefix))
+        .count();
+    assert!(
+        scan_reads > 0,
+        "the control scan should have read data files"
+    );
+}
+
+/// `with_fragments` narrows the universe: a fragment outside the scope is in neither set,
+/// so the index's wider coverage must not leak scope-external fragments into the answer.
+#[tokio::test]
+async fn test_candidate_fragments_honors_fragment_scope() {
+    let (dataset, _dir) = candidate_fragment_fixture(Some(IndexType::ZoneMap), false).await;
+    let scoped = dataset
+        .get_fragments()
+        .into_iter()
+        .filter(|fragment| matches!(fragment.id(), 1 | 2))
+        .map(|fragment| fragment.metadata().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(scoped.len(), 2);
+
+    let mut scan = dataset.scan();
+    scan.with_fragments(scoped).filter("value = 150").unwrap();
+    let candidates = scan.candidate_fragments().await.unwrap();
+
+    assert_eq!(candidates.hits, frag_set([1]));
+    assert_eq!(candidates.unknown, RoaringBitmap::new());
+    // Fragment 4 is uncovered by the index, but it is also out of scope, so it must not
+    // be reported.
+    assert!(!candidates.to_scan().contains(4), "{candidates:?}");
+}
+
+/// Compaction rewrites both the fragments and the indices' declared coverage, and a zone
+/// map cannot be remapped at all. Pruning afterwards must not lose a fragment that holds
+/// a match -- the hazard being an index whose stored addresses and whose declared
+/// coverage disagree about fragment ids.
+///
+/// The exact sets are deliberately not asserted: they depend on whether the index type
+/// survives compaction. `candidates_for` cross-checks against a real scan, which is the
+/// property that actually matters here.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::zonemap(IndexType::ZoneMap)]
+#[tokio::test]
+async fn test_candidate_fragments_after_compaction(#[case] index_type: IndexType) {
+    let (mut dataset, _dir) = candidate_fragment_fixture(Some(index_type), false).await;
+    crate::dataset::optimize::compact_files(&mut dataset, Default::default(), None)
+        .await
+        .unwrap();
+
+    let candidates = candidates_for(&dataset, "value = 150").await;
+    assert!(
+        !candidates.to_scan().is_empty(),
+        "the matching row must still be reachable: {candidates:?}"
+    );
 }
