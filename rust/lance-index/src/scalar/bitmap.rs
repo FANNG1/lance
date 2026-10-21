@@ -928,6 +928,82 @@ impl BitmapIndex {
 
 #[async_trait]
 impl ScalarIndex for BitmapIndex {
+    async fn search_fragments(
+        &self,
+        query: &dyn AnyQuery,
+        mapper: &dyn super::FragmentMapper,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        let Some(query) = query.as_any().downcast_ref::<SargableQuery>() else {
+            return Ok(None);
+        };
+        let mut include_nulls = false;
+        let keys: Vec<_> = match query {
+            SargableQuery::Equals(value) => {
+                include_nulls = value.is_null();
+                if include_nulls {
+                    Vec::new()
+                } else {
+                    vec![OrderableScalarValue(value.clone())]
+                }
+            }
+            SargableQuery::IsNull() => {
+                include_nulls = true;
+                Vec::new()
+            }
+            SargableQuery::IsIn(values) => values
+                .iter()
+                .filter_map(|value| {
+                    if value.is_null() {
+                        include_nulls = true;
+                        None
+                    } else {
+                        Some(OrderableScalarValue(value.clone()))
+                    }
+                })
+                .collect(),
+            SargableQuery::Range(start, end) => {
+                let start = start
+                    .as_ref()
+                    .map(|value| OrderableScalarValue(value.clone()));
+                let end = end
+                    .as_ref()
+                    .map(|value| OrderableScalarValue(value.clone()));
+                let empty = match (&start, &end) {
+                    (Bound::Included(a), Bound::Included(b)) => a > b,
+                    (
+                        Bound::Included(a) | Bound::Excluded(a),
+                        Bound::Included(b) | Bound::Excluded(b),
+                    ) => a >= b,
+                    _ => false,
+                };
+                if empty {
+                    Vec::new()
+                } else {
+                    self.index_map
+                        .range((start, end))
+                        .map(|(key, _)| key.clone())
+                        .collect()
+                }
+            }
+            _ => return Ok(None),
+        };
+        metrics.record_comparisons(keys.len());
+        let mut fragments = if include_nulls {
+            mapper.map_rows(&self.null_map)?
+        } else {
+            RoaringBitmap::new()
+        };
+        let tasks = keys
+            .into_iter()
+            .map(|key| async move { self.load_bitmap(&key, Some(metrics)).await });
+        let mut bitmaps = stream::iter(tasks).buffer_unordered(get_num_compute_intensive_cpus());
+        while let Some(bitmap) = bitmaps.try_next().await? {
+            fragments |= mapper.map_rows(&bitmap)?;
+        }
+        Ok(Some(fragments))
+    }
+
     #[instrument(name = "bitmap_search", level = "debug", skip_all)]
     async fn search(
         &self,

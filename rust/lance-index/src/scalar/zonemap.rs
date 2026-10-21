@@ -734,6 +734,35 @@ impl Index for ZoneMapIndex {
 
 #[async_trait]
 impl ScalarIndex for ZoneMapIndex {
+    async fn search_fragments(
+        &self,
+        query: &dyn AnyQuery,
+        _mapper: &dyn super::FragmentMapper,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        let Some(query) = query.as_any().downcast_ref::<SargableQuery>() else {
+            return Ok(None);
+        };
+        // Zone bounds name the original fragments. Without a fragment-level
+        // translation, retaining coverage is safer than using those old IDs.
+        if self.fri.is_some() || self.batch_remapper.is_some() {
+            return Ok(None);
+        }
+        metrics.record_comparisons(self.zones.len());
+        let mut fragments = RoaringBitmap::new();
+        for zone in &self.zones {
+            if self.evaluate_zone_against_query(zone, query)? {
+                fragments.insert(u32::try_from(zone.bound.fragment_id).map_err(|_| {
+                    Error::index(format!(
+                        "Zone fragment ID {} exceeds u32",
+                        zone.bound.fragment_id
+                    ))
+                })?);
+            }
+        }
+        Ok(Some(fragments))
+    }
+
     async fn search(
         &self,
         query: &dyn AnyQuery,
