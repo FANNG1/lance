@@ -30,9 +30,10 @@ pub use lance_index_core::remapping::{
     materialize_remap,
 };
 pub use lance_index_core::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, FragmentMapper, IndexFile, IndexReader, IndexStore,
+    IndexWriter, LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+    ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering,
+    UpdateCriteria,
 };
 
 pub mod bitmap;

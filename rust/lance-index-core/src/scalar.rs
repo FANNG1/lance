@@ -429,6 +429,20 @@ impl PartialEq for dyn AnyQuery {
     }
 }
 
+/// Maps index entries to fragments without reading dataset values.
+///
+/// The caller binds this mapper to the index's identifier domain (see
+/// [`ScalarIndex::results_are_row_addresses`]) and a fixed dataset snapshot.
+/// Implementations must use only resident metadata; missing mappings must be
+/// retained separately as unresolved fragments by the caller.
+pub trait FragmentMapper: Send + Sync {
+    /// Map a bounded batch of identifiers in the index's declared domain.
+    fn map_ids(&self, ids: &[u64]) -> Result<RoaringBitmap>;
+
+    /// Map a compressed set without expanding physical-address selections.
+    fn map_rows(&self, rows: &RowAddrTreeMap) -> Result<RoaringBitmap>;
+}
+
 /// The result of a search operation against a scalar index
 #[derive(Debug, PartialEq)]
 pub enum SearchResult {
@@ -666,6 +680,22 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         self.search(query, metrics).await
+    }
+
+    /// Find possible matching fragments using only index files.
+    ///
+    /// `Some` is a complete upper bound within this segment's coverage; an
+    /// empty bitmap proves no match there. `None` means this implementation
+    /// cannot prune and the caller must retain its coverage. Implementations
+    /// must not read dataset files or return a partial result as complete.
+    /// The mapper interprets entries in this index's identifier domain.
+    async fn search_fragments(
+        &self,
+        _query: &dyn AnyQuery,
+        _mapper: &dyn FragmentMapper,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        Ok(None)
     }
 
     /// Returns true if this index reports matches as physical row addresses
