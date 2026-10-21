@@ -675,6 +675,25 @@ impl RowAddrTreeMap {
         self.inner.iter()
     }
 
+    /// The fragments in which this set selects at least one row, ascending.
+    ///
+    /// Only meaningful on an address-domain set, where a key *is* the fragment id.
+    /// On a stable-row-id set the keys are the high bits of row ids and carry no
+    /// fragment meaning.
+    ///
+    /// `O(num_fragments)`: no row is materialized, and a `Full` entry is handled
+    /// without enumerating it (unlike [`Self::into_addr_iter`], which panics on one).
+    /// A `Partial` entry can hold an empty bitmap, e.g. after a subtraction, and
+    /// selects nothing, so an entry's presence alone is not enough.
+    pub fn fragment_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.inner
+            .iter()
+            .filter_map(|(fragment_id, selection)| match selection {
+                RowAddrSelection::Full => Some(*fragment_id),
+                RowAddrSelection::Partial(rows) => (!rows.is_empty()).then_some(*fragment_id),
+            })
+    }
+
     pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
         let frag_id_set = frag_ids.into_iter().collect::<HashSet<_>>();
         self.inner
@@ -1326,6 +1345,23 @@ mod tests {
 
     fn rows(ids: &[u64]) -> RowAddrTreeMap {
         RowAddrTreeMap::from_iter(ids)
+    }
+
+    /// A `Full` entry must be reported without being enumerated, and a `Partial` entry
+    /// holding an empty bitmap -- which a subtraction can leave behind -- selects nothing
+    /// and must not be reported.
+    #[test]
+    fn test_fragment_ids_skips_empty_partials() {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_fragment(7);
+        map.insert_bitmap(3, RoaringBitmap::from_iter([1_u32, 4]));
+        map.insert_bitmap(5, RoaringBitmap::new());
+
+        assert_eq!(map.fragment_ids().collect::<Vec<_>>(), vec![3, 7]);
+        assert_eq!(
+            RowAddrTreeMap::new().fragment_ids().collect::<Vec<_>>(),
+            Vec::<u32>::new()
+        );
     }
 
     fn assert_mask_selects(mask: &RowAddrMask, selected: &[u64], not_selected: &[u64]) {
