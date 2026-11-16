@@ -557,7 +557,7 @@ impl Scanner {
         Ok(())
     }
 
-    async fn create_filter_plan(
+    pub(super) async fn create_filter_plan(
         &self,
         use_scalar_index: bool,
         query_filter: Option<QueryFilter>,

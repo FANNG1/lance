@@ -742,6 +742,21 @@ pub fn lookup_batch(
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
+    /// Return a complete conservative fragment set using only index files.
+    /// `None` means unsupported; callers must retain the segment coverage.
+    /// `has_stable_row_ids` distinguishes logical IDs from the physical IDs
+    /// used by datasets without stable row IDs. Returned fragments must refer
+    /// to the current physical address domain. No dataset or
+    /// deletion files may be read, and partial results must never be returned.
+    async fn search_fragments(
+        &self,
+        _query: &dyn AnyQuery,
+        _has_stable_row_ids: bool,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        Ok(None)
+    }
+
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered
