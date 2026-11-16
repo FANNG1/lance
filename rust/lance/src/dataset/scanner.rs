@@ -12,6 +12,8 @@
 
 mod aggregate;
 mod builder;
+mod fragment_pruning;
+pub use fragment_pruning::FragmentCandidates;
 pub(crate) mod fts;
 mod list_structure;
 mod minhash;

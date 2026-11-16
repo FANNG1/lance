@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_record_batch_async};
@@ -2239,6 +2240,57 @@ impl BTreeIndex {
         Ok(result)
     }
 
+    fn fragment_candidate_pages(&self, query: &SargableQuery) -> Result<Vec<Matches>> {
+        match query {
+            SargableQuery::Equals(val) => self
+                .page_lookup
+                .pages_eq(&OrderableScalarValue(val.clone())),
+            SargableQuery::Range(start, end) => self
+                .page_lookup
+                .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
+            SargableQuery::IsIn(values) => self
+                .page_lookup
+                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
+            SargableQuery::FullTextSearch(_) => Err(Error::invalid_input(
+                "full text search is not supported for BTree index, build a inverted index for it",
+            )),
+            SargableQuery::IsNull() => Ok(self.page_lookup.pages_null()),
+            SargableQuery::LikePrefix(prefix) => {
+                // Convert LikePrefix to a range query: [prefix, next_prefix)
+                match prefix {
+                    ScalarValue::Utf8(Some(s)) => {
+                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
+                        let end = match compute_next_prefix(s) {
+                            Some(next) => {
+                                Bound::Excluded(OrderableScalarValue(ScalarValue::Utf8(Some(next))))
+                            }
+                            None => Bound::Unbounded,
+                        };
+                        self.page_lookup
+                            .pages_between((start.as_ref(), end.as_ref()))
+                    }
+                    ScalarValue::LargeUtf8(Some(s)) => {
+                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
+                        let end = match compute_next_prefix(s) {
+                            Some(next) => Bound::Excluded(OrderableScalarValue(
+                                ScalarValue::LargeUtf8(Some(next)),
+                            )),
+                            None => Bound::Unbounded,
+                        };
+                        self.page_lookup
+                            .pages_between((start.as_ref(), end.as_ref()))
+                    }
+                    _ => {
+                        // Conservative: return all pages for non-string types
+                        // This is consistent with ZoneMap behavior
+                        self.page_lookup
+                            .pages_between((Bound::Unbounded, Bound::Unbounded))
+                    }
+                }
+            }
+        }
+    }
+
     /// Look up a page, reading and caching it on its own if it is not already
     /// cached.
     async fn lookup_page(
@@ -3204,6 +3256,41 @@ impl ScalarIndex for BTreeIndex {
             .await
     }
 
+    async fn search_fragments(
+        &self,
+        query: &dyn AnyQuery,
+        has_stable_row_ids: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        if (has_stable_row_ids && !self.results_are_row_addresses)
+            || self.frag_reuse_index.is_some()
+            || self.batch_remapper.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(query) = query.as_any().downcast_ref::<SargableQuery>() else {
+            return Ok(None);
+        };
+        if matches!(query, SargableQuery::FullTextSearch(_)) {
+            return Ok(None);
+        }
+        let pages = self.fragment_candidate_pages(query)?;
+        let prebuilt = match query {
+            SargableQuery::IsIn(_) => Some(self.compile_predicate(query)?),
+            _ => None,
+        };
+        let mut stream = self.evaluate_pages_stream(pages, metrics, move |page, matches| {
+            Self::evaluate_page_matches(page, matches, query, prebuilt.as_ref(), false, metrics)
+        });
+        let mut fragments = RoaringBitmap::new();
+        while let Some(matches) = stream.try_next().await? {
+            for address in matches.selected() {
+                fragments.insert(RowAddress::from(*address).fragment_id());
+            }
+        }
+        Ok(Some(fragments))
+    }
+
     async fn search_with_options(
         &self,
         query: &dyn AnyQuery,
@@ -3211,56 +3298,7 @@ impl ScalarIndex for BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let mut pages = match query {
-            SargableQuery::Equals(val) => self
-                .page_lookup
-                .pages_eq(&OrderableScalarValue(val.clone())),
-            SargableQuery::Range(start, end) => self
-                .page_lookup
-                .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
-            SargableQuery::IsIn(values) => self
-                .page_lookup
-                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            SargableQuery::FullTextSearch(_) => {
-                return Err(Error::invalid_input(
-                    "full text search is not supported for BTree index, build a inverted index for it",
-                ));
-            }
-            SargableQuery::IsNull() => Ok(self.page_lookup.pages_null()),
-            SargableQuery::LikePrefix(prefix) => {
-                // Convert LikePrefix to a range query: [prefix, next_prefix)
-                match prefix {
-                    ScalarValue::Utf8(Some(s)) => {
-                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
-                        let end = match compute_next_prefix(s) {
-                            Some(next) => {
-                                Bound::Excluded(OrderableScalarValue(ScalarValue::Utf8(Some(next))))
-                            }
-                            None => Bound::Unbounded,
-                        };
-                        self.page_lookup
-                            .pages_between((start.as_ref(), end.as_ref()))
-                    }
-                    ScalarValue::LargeUtf8(Some(s)) => {
-                        let start = Bound::Included(OrderableScalarValue(prefix.clone()));
-                        let end = match compute_next_prefix(s) {
-                            Some(next) => Bound::Excluded(OrderableScalarValue(
-                                ScalarValue::LargeUtf8(Some(next)),
-                            )),
-                            None => Bound::Unbounded,
-                        };
-                        self.page_lookup
-                            .pages_between((start.as_ref(), end.as_ref()))
-                    }
-                    _ => {
-                        // Conservative: return all pages for non-string types
-                        // This is consistent with ZoneMap behavior
-                        self.page_lookup
-                            .pages_between((Bound::Unbounded, Bound::Unbounded))
-                    }
-                }
-            }
-        }?;
+        let mut pages = self.fragment_candidate_pages(query)?;
 
         // For non-IsNull queries, also include null pages so that null row IDs
         // are tracked in the result. Any comparison with NULL yields NULL, and
@@ -5423,8 +5461,11 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_wide_range_query_prefetches_in_bounded_chunks() {
+    async fn test_wide_range_query_prefetches_in_bounded_chunks(
+        #[values(false, true)] fragments_only: bool,
+    ) {
         let tmpdir = TempObjDir::default();
         let object_store = Arc::new(ObjectStore::local());
         let test_store = Arc::new(LanceIndexStore::new(
@@ -5467,11 +5508,21 @@ mod tests {
             std::ops::Bound::Excluded(ScalarValue::Float32(Some(40000.0))),
         );
         let metrics = LocalMetricsCollector::default();
-        let result = index.search(&query, &metrics).await.unwrap();
-        let SearchResult::Exact(selection) = result else {
-            panic!("expected an exact search result");
-        };
-        assert_eq!(selection.selected_rows().len(), Some(40000));
+        if fragments_only {
+            assert_eq!(
+                index
+                    .search_fragments(&query, false, &metrics)
+                    .await
+                    .unwrap(),
+                Some(roaring::RoaringBitmap::from_iter([0]))
+            );
+        } else {
+            let result = index.search(&query, &metrics).await.unwrap();
+            let SearchResult::Exact(selection) = result else {
+                panic!("expected exact result");
+            };
+            assert_eq!(selection.selected_rows().len(), Some(40000));
+        }
 
         let parts_loaded = metrics.parts_loaded.load(Ordering::Relaxed) as u64;
         let expected_chunks = parts_loaded.div_ceil(PAGE_PREFETCH_CHUNK_SIZE as u64);
